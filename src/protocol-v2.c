@@ -292,7 +292,6 @@ static void cmd_leave(Player *p, Room rooms[], Game games[], Player players[]) {
     p->connected = 1;
 }
 
-
 static void cmd_place(Player *p, Room rooms[], Game games[], Player players[], int x, int y, int len, char dir) {
     if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
     if (p->current_room_id == -1) { net_send_all(p->socket_fd, "ERROR NOT_IN_ROOM\n"); strike(p, rooms, games, players, NULL); return; }
@@ -304,27 +303,27 @@ static void cmd_place(Player *p, Room rooms[], Game games[], Player players[], i
     Game *g = game_for_room(r, games);
     if (!g || !g->in_use) { net_send_all(p->socket_fd, "ERROR NO_GAME\n"); return; }
 
-    // Only valid inside PLACING_START..PLACING_STOP batch.
-    if (!p->placing_mode) {
-        net_send_all(p->socket_fd, "ERROR PLACE NOT_PLACING\n");
-        strike(p, rooms, games, players, NULL);
+    // In batch placing mode: just buffer ships. No spam back.
+    if (p->placing_mode) {
+        if (p->pending_count >= PENDING_MAX) {
+            net_send_all(p->socket_fd, "ERROR SHIPS TOO_MANY\n");
+            strike(p, rooms, games, players, NULL);
+            return;
+        }
+
+        PendingShip *ps = &p->pending[p->pending_count++];
+        ps->x = x;
+        ps->y = y;
+        ps->len = len;
+        ps->dir = dir;
+
         return;
     }
 
-    if (p->pending_count >= PENDING_MAX) {
-        net_send_all(p->socket_fd, "ERROR SHIPS TOO_MANY\n");
-        strike(p, rooms, games, players, NULL);
-        return;
-    }
-
-    PendingShip *ps = &p->pending[p->pending_count++];
-    ps->x = x;
-    ps->y = y;
-    ps->len = len;
-    ps->dir = dir;
+    // If not in batch mode, force the client to use PLACING/PLACING_STOP
+    net_send_all(p->socket_fd, "ERROR PLACE USE_PLACING\n");
+    strike(p, rooms, games, players, NULL);
 }
-
-
 
 static void cmd_placing(Player *p, Room rooms[], Game games[], Player players[]) {
     if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
@@ -334,19 +333,11 @@ static void cmd_placing(Player *p, Room rooms[], Game games[], Player players[])
     if (!r) { net_send_all(p->socket_fd, "ERROR ROOM_NOT_FOUND\n"); return; }
     if (r->phase != PHASE_SETUP) { net_send_all(p->socket_fd, "ERROR BAD_STATE\n"); strike(p, rooms, games, players, NULL); return; }
 
-    Game *g = game_for_room(r, games);
-    if (!g || !g->in_use) { net_send_all(p->socket_fd, "ERROR NO_GAME\n"); return; }
-
-    // Starting a batch ALWAYS resets only THIS player's setup so player2 never appends to player1.
-    game_clear_player_setup(g, p->player_slot);
+    // start buffering
     p->placing_mode = 1;
     p->pending_count = 0;
     memset(p->pending, 0, sizeof(p->pending));
-
-    net_send_all(p->socket_fd, "PLACING_START\n");
 }
-
-
 
 static void cmd_placing_stop(Player *p, Room rooms[], Game games[], Player players[]) {
     if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
@@ -362,7 +353,9 @@ static void cmd_placing_stop(Player *p, Room rooms[], Game games[], Player playe
     if (!p->placing_mode) { net_send_all(p->socket_fd, "ERROR SHIPS NOT_PLACING\n"); strike(p, rooms, games, players, NULL); return; }
     if (p->pending_count != PENDING_MAX) { net_send_all(p->socket_fd, "ERROR SHIPS INCOMPLETE\n"); strike(p, rooms, games, players, NULL); return; }
 
-    // apply buffered ships to THIS player's board
+    // clear previous setup (if any) and apply buffered ships
+    game_clear_player_setup(g, p->player_slot);
+
     for (int i = 0; i < p->pending_count; i++) {
         PendingShip *ps = &p->pending[i];
         char err[64];
@@ -372,7 +365,7 @@ static void cmd_placing_stop(Player *p, Room rooms[], Game games[], Player playe
             net_send_all(p->socket_fd, err);
             net_send_all(p->socket_fd, "\n");
 
-            // keep it clean on failure (only this player)
+            // keep it clean on failure
             game_clear_player_setup(g, p->player_slot);
             pending_reset(p);
             strike(p, rooms, games, players, NULL);
@@ -380,13 +373,14 @@ static void cmd_placing_stop(Player *p, Room rooms[], Game games[], Player playe
         }
     }
 
+    // done buffering
     pending_reset(p);
 
-    // Mark this player as ready internally (no READY command exposed to client).
+    // AUTO READY
     {
         char err2[64];
         if (!game_set_ready(g, p->player_slot, err2, sizeof(err2))) {
-            net_send_all(p->socket_fd, "ERROR SHIPS ");
+            net_send_all(p->socket_fd, "ERROR READY ");
             net_send_all(p->socket_fd, err2);
             net_send_all(p->socket_fd, "\n");
             strike(p, rooms, games, players, NULL);
@@ -394,34 +388,65 @@ static void cmd_placing_stop(Player *p, Room rooms[], Game games[], Player playe
         }
     }
 
+    // minimal ack
     net_send_all(p->socket_fd, "SHIPS_OK\n");
 
-    // If both players finished placing -> start game.
+    // tell opponent
+    notify_opponent(r, players, p->player_slot, "OPPONENT_READY\n");
+
+    // if both ready -> start game
     if (game_all_ready(g)) {
         room_set_phase(r, PHASE_PLAY);
 
-        for (int slot = 0; slot < 2; slot++) {
-            if (!r->slot_connected[slot]) continue;
-            int fd = r->player_fds[slot];
-            if (fd >= 0) net_send_all(fd, "PLAY\n");
-        }
+        // send PLAY to both
+        net_send_all(p->socket_fd, "PLAY\n");
+        log_info("Player fd=%d name=%s notified of PLAY", p->socket_fd, p->player_name);
+        notify_opponent(r, players, p->player_slot, "PLAY\n");
+        log_info("Player slot=%d in room=%d notified of PLAY", (p->player_slot == 0) ? 1 : 0, r->id);
+        
 
-        // Send YOUR_TURN / OPP_TURN (handled inside game_send_turn)
+        // send turn info
         game_send_turn(g, r, players);
     }
 }
 
 
-
-
 static void cmd_ready(Player *p, Room rooms[], Game games[], Player players[]) {
-    (void)rooms; (void)games; (void)players;
-    if (!p || p->socket_fd < 0) return;
-    // READY is intentionally disabled: ships placement completion is the only "ready" path.
-    net_send_all(p->socket_fd, "ERROR READY_DISABLED\n");
+    if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
+    if (p->current_room_id == -1) { net_send_all(p->socket_fd, "ERROR NOT_IN_ROOM\n"); strike(p, rooms, games, players, NULL); return; }
+
+    Room *r = find_room_by_id(rooms, p->current_room_id);
+    if (!r) { net_send_all(p->socket_fd, "ERROR ROOM_NOT_FOUND\n"); return; }
+    if (r->phase != PHASE_SETUP) { net_send_all(p->socket_fd, "ERROR BAD_STATE\n"); strike(p, rooms, games, players, NULL); return; }
+
+    Game *g = game_for_room(r, games);
+    if (!g || !g->in_use) { net_send_all(p->socket_fd, "ERROR NO_GAME\n"); return; }
+
+    char err[64];
+    if (!game_set_ready(g, p->player_slot, err, sizeof(err))) {
+        char out[96];
+        snprintf(out, sizeof(out), "ERROR READY %s\n", err);
+        net_send_all(p->socket_fd, out);
+        strike(p, rooms, games, players, NULL);
+        return;
+    }
+
+    net_send_all(p->socket_fd, "OK READY\n");
+    notify_opponent(r, players, p->player_slot, "OPPONENT_READY\n");
+
+   if (game_all_ready(g)) {
+    room_set_phase(r, PHASE_PLAY);
+
+    for (int slot = 0; slot < 2; slot++) {
+        if (!r->slot_connected[slot]) continue;
+        int fd = r->player_fds[slot];
+        if (fd >= 0) net_send_all(fd, "PLAY\n");
+    }
+
+    game_send_turn(g, r, players);
 }
 
-
+}
 
 static void cmd_shoot(Player *p, Room rooms[], Game games[], Player players[], int x, int y) {
     if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
@@ -459,6 +484,11 @@ static void cmd_shoot(Player *p, Room rooms[], Game games[], Player players[], i
         room_set_phase(r, PHASE_FINISHED);
     }
 
+    for (int slot = 0; slot < 2; slot++) {
+        if (!r->slot_connected[slot]) continue;
+        Player *pp = find_player_by_fd(players, r->player_fds[slot]);
+        if (pp) game_send_state(g, r, pp);
+    }
 
     game_send_turn(g, r, players);
 }
@@ -510,8 +540,8 @@ void protocol_handle_line(Player *p, Room rooms[], Game games[], Player players[
     }
 
     if (strcmp(cmd, "LEAVE") == 0) { cmd_leave(p, rooms, games, players); return; }
-    if (strcmp(cmd, "PLACING_START") == 0 || strcmp(cmd, "PLACING") == 0) { cmd_placing(p, rooms, games, players); return; }
-    if (strcmp(cmd, "PLACING_STOP") == 0 || strcmp(cmd, "PLACING_END") == 0) { cmd_placing_stop(p, rooms, games, players); return; }
+    if (strcmp(cmd, "PLACING") == 0) { cmd_placing(p, rooms, games, players); return; }
+    if (strcmp(cmd, "PLACING_STOP") == 0) { cmd_placing_stop(p, rooms, games, players); return; }
 
     if (strcmp(cmd, "PLACE") == 0) {
         int x,y,len; char dir;

@@ -6,6 +6,7 @@
 #include "log.h"
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/socket.h>
 
@@ -292,28 +293,107 @@ static void cmd_leave(Player *p, Room rooms[], Game games[], Player players[]) {
     p->connected = 1;
 }
 
+static void sendf_fd(int fd, const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return net_send_all(fd, buf);
+}
 
-static void cmd_place(Player *p, Room rooms[], Game games[], Player players[], int x, int y, int len, char dir) {
-    if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
-    if (p->current_room_id == -1) { net_send_all(p->socket_fd, "ERROR NOT_IN_ROOM\n"); strike(p, rooms, games, players, NULL); return; }
+// Small helper to keep command handlers clean.
+// If strike_it is 1, we also count it as an invalid command usage (MAX_INVALID).
+static void reply_error(Player *p, Room rooms[], Game games[], Player players[],
+                        int strike_it, const char *code, const char *detail) {
+    if (!p) return;
+    if (detail && detail[0]) sendf_fd(p->socket_fd, "ERROR %s %s\n", code, detail);
+    else sendf_fd(p->socket_fd, "ERROR %s\n", code);
+    if (strike_it) strike(p, rooms, games, players, NULL);
+}
+
+static int require_identified(Player *p, Room rooms[], Game games[], Player players[]) {
+    if (p && p->is_identified) return 1;
+    reply_error(p, rooms, games, players, 1, "MUST_HELLO", NULL);
+    return 0;
+}
+
+static int require_in_room(Player *p, Room rooms[], Game games[], Player players[], Room **out_r, Game **out_g) {
+    if (!require_identified(p, rooms, games, players)) return 0;
+    if (!p || p->current_room_id == -1) { reply_error(p, rooms, games, players, 1, "NOT_IN_ROOM", NULL); return 0; }
 
     Room *r = find_room_by_id(rooms, p->current_room_id);
-    if (!r) { net_send_all(p->socket_fd, "ERROR ROOM_NOT_FOUND\n"); return; }
-    if (r->phase != PHASE_SETUP) { net_send_all(p->socket_fd, "ERROR BAD_STATE\n"); strike(p, rooms, games, players, NULL); return; }
+    if (!r) { reply_error(p, rooms, games, players, 0, "ROOM_NOT_FOUND", NULL); return 0; }
 
     Game *g = game_for_room(r, games);
-    if (!g || !g->in_use) { net_send_all(p->socket_fd, "ERROR NO_GAME\n"); return; }
+    if (!g) { reply_error(p, rooms, games, players, 0, "GAME_NOT_FOUND", NULL); return 0; }
 
-    // Only valid inside PLACING_START..PLACING_STOP batch.
+    if (out_r) *out_r = r;
+    if (out_g) *out_g = g;
+    return 1;
+}
+
+static int require_setup(Player *p, Room rooms[], Game games[], Player players[], Room **out_r, Game **out_g) {
+    Room *r = NULL;
+    Game *g = NULL;
+    if (!require_in_room(p, rooms, games, players, &r, &g)) return 0;
+
+    if (r->phase != PHASE_SETUP) {
+        reply_error(p, rooms, games, players, 1, "BAD_STATE", "NOT_SETUP");
+        return 0;
+    }
+
+    if (p->player_slot < 0 || p->player_slot > 1) {
+        reply_error(p, rooms, games, players, 0, "BAD_STATE", "NO_SLOT");
+        return 0;
+    }
+
+    if (out_r) *out_r = r;
+    if (out_g) *out_g = g;
+    return 1;
+}
+
+/*
+ * SETUP flow (clean):
+ *   PLACING_START
+ *   PLACING x y len dir   (repeat for each ship)
+ *   PLACING_END
+ *
+ * On PLACING_END -> validate + apply ships -> SHIPS_OK
+ * Once BOTH players have SHIPS_OK -> both get PLAY, then turn message(s).
+ *
+ * READY is intentionally not supported anymore.
+ */
+
+static void cmd_placing_start(Player *p, Room rooms[], Game games[], Player players[]) {
+    Room *r = NULL;
+    Game *g = NULL;
+    if (!require_setup(p, rooms, games, players, &r, &g)) return;
+
+    // allow restart of setup for this player
+    game_clear_player_setup(g, p->player_slot);
+    pending_reset(p);
+
+    p->placing_mode = 1;
+    // optional: ack, but client doesn't need it
+    // sendf_fd(p->socket_fd, "PLACING_STARTED\n");
+    (void)r;
+}
+
+static void cmd_placing_add(Player *p, Room rooms[], Game games[], Player players[], int x, int y, int len, char dir) {
+    Room *r = NULL;
+    Game *g = NULL;
+    if (!require_setup(p, rooms, games, players, &r, &g)) return;
+
     if (!p->placing_mode) {
-        net_send_all(p->socket_fd, "ERROR PLACE NOT_PLACING\n");
-        strike(p, rooms, games, players, NULL);
+        reply_error(p, rooms, games, players, 1, "PLACING", "NOT_STARTED");
         return;
     }
 
-    if (p->pending_count >= PENDING_MAX) {
-        net_send_all(p->socket_fd, "ERROR SHIPS TOO_MANY\n");
-        strike(p, rooms, games, players, NULL);
+    // buffer ship
+    int cap = (int)(sizeof(p->pending) / sizeof(p->pending[0]));
+    if (p->pending_count >= cap) {
+        reply_error(p, rooms, games, players, 1, "PLACING", "TOO_MANY");
         return;
     }
 
@@ -322,57 +402,28 @@ static void cmd_place(Player *p, Room rooms[], Game games[], Player players[], i
     ps->y = y;
     ps->len = len;
     ps->dir = dir;
+
+    (void)g; (void)r;
 }
 
+static void cmd_placing_end(Player *p, Room rooms[], Game games[], Player players[]) {
+    Room *r = NULL;
+    Game *g = NULL;
+    if (!require_setup(p, rooms, games, players, &r, &g)) return;
 
+    if (!p->placing_mode) {
+        reply_error(p, rooms, games, players, 1, "PLACING", "NOT_STARTED");
+        return;
+    }
 
-static void cmd_placing(Player *p, Room rooms[], Game games[], Player players[]) {
-    if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
-    if (p->current_room_id == -1) { net_send_all(p->socket_fd, "ERROR NOT_IN_ROOM\n"); strike(p, rooms, games, players, NULL); return; }
-
-    Room *r = find_room_by_id(rooms, p->current_room_id);
-    if (!r) { net_send_all(p->socket_fd, "ERROR ROOM_NOT_FOUND\n"); return; }
-    if (r->phase != PHASE_SETUP) { net_send_all(p->socket_fd, "ERROR BAD_STATE\n"); strike(p, rooms, games, players, NULL); return; }
-
-    Game *g = game_for_room(r, games);
-    if (!g || !g->in_use) { net_send_all(p->socket_fd, "ERROR NO_GAME\n"); return; }
-
-    // Starting a batch ALWAYS resets only THIS player's setup so player2 never appends to player1.
-    game_clear_player_setup(g, p->player_slot);
-    p->placing_mode = 1;
-    p->pending_count = 0;
-    memset(p->pending, 0, sizeof(p->pending));
-
-    net_send_all(p->socket_fd, "PLACING_START\n");
-}
-
-
-
-static void cmd_placing_stop(Player *p, Room rooms[], Game games[], Player players[]) {
-    if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
-    if (p->current_room_id == -1) { net_send_all(p->socket_fd, "ERROR NOT_IN_ROOM\n"); strike(p, rooms, games, players, NULL); return; }
-
-    Room *r = find_room_by_id(rooms, p->current_room_id);
-    if (!r) { net_send_all(p->socket_fd, "ERROR ROOM_NOT_FOUND\n"); return; }
-    if (r->phase != PHASE_SETUP) { net_send_all(p->socket_fd, "ERROR BAD_STATE\n"); strike(p, rooms, games, players, NULL); return; }
-
-    Game *g = game_for_room(r, games);
-    if (!g || !g->in_use) { net_send_all(p->socket_fd, "ERROR NO_GAME\n"); return; }
-
-    if (!p->placing_mode) { net_send_all(p->socket_fd, "ERROR SHIPS NOT_PLACING\n"); strike(p, rooms, games, players, NULL); return; }
-    if (p->pending_count != PENDING_MAX) { net_send_all(p->socket_fd, "ERROR SHIPS INCOMPLETE\n"); strike(p, rooms, games, players, NULL); return; }
-
-    // apply buffered ships to THIS player's board
+    // apply buffered ships
     for (int i = 0; i < p->pending_count; i++) {
         PendingShip *ps = &p->pending[i];
         char err[64];
 
         if (!game_place_ship(g, p->player_slot, ps->x, ps->y, ps->len, ps->dir, err, sizeof(err))) {
-            net_send_all(p->socket_fd, "ERROR SHIPS ");
-            net_send_all(p->socket_fd, err);
-            net_send_all(p->socket_fd, "\n");
-
-            // keep it clean on failure (only this player)
+            // keep it clean on failure
+            sendf_fd(p->socket_fd, "ERROR SHIPS %s\n", err);
             game_clear_player_setup(g, p->player_slot);
             pending_reset(p);
             strike(p, rooms, games, players, NULL);
@@ -380,48 +431,43 @@ static void cmd_placing_stop(Player *p, Room rooms[], Game games[], Player playe
         }
     }
 
+    // done buffering
     pending_reset(p);
 
-    // Mark this player as ready internally (no READY command exposed to client).
+    // mark player as ready (internally) so we can start once both placed ships
     {
         char err2[64];
         if (!game_set_ready(g, p->player_slot, err2, sizeof(err2))) {
-            net_send_all(p->socket_fd, "ERROR SHIPS ");
-            net_send_all(p->socket_fd, err2);
-            net_send_all(p->socket_fd, "\n");
+            sendf_fd(p->socket_fd, "ERROR SHIPS %s\n", err2);
             strike(p, rooms, games, players, NULL);
             return;
         }
     }
 
-    net_send_all(p->socket_fd, "SHIPS_OK\n");
+    // ack for this player
+    sendf_fd(p->socket_fd, "SHIPS_OK\n");
 
-    // If both players finished placing -> start game.
+    // if both ready -> start game for both
     if (game_all_ready(g)) {
         room_set_phase(r, PHASE_PLAY);
 
         for (int slot = 0; slot < 2; slot++) {
             if (!r->slot_connected[slot]) continue;
             int fd = r->player_fds[slot];
-            if (fd >= 0) net_send_all(fd, "PLAY\n");
+            if (fd >= 0) sendf_fd(fd, "PLAY\n");
         }
 
-        // Send YOUR_TURN / OPP_TURN (handled inside game_send_turn)
+        // This should send per-player turn info (YOUR_TURN / OPP_TURN) if your Game layer does it.
+        // If your game_send_turn currently sends something else, adjust it there (game.c).
         game_send_turn(g, r, players);
     }
 }
 
-
-
-
-static void cmd_ready(Player *p, Room rooms[], Game games[], Player players[]) {
-    (void)rooms; (void)games; (void)players;
-    if (!p || p->socket_fd < 0) return;
-    // READY is intentionally disabled: ships placement completion is the only "ready" path.
-    net_send_all(p->socket_fd, "ERROR READY_DISABLED\n");
+// Legacy single-ship command is disabled to keep setup consistent/clean.
+static void cmd_place(Player *p, Room rooms[], Game games[], Player players[], int x, int y, int len, char dir) {
+    (void)x; (void)y; (void)len; (void)dir;
+    reply_error(p, rooms, games, players, 1, "PLACE", "USE_PLACING");
 }
-
-
 
 static void cmd_shoot(Player *p, Room rooms[], Game games[], Player players[], int x, int y) {
     if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
@@ -459,6 +505,11 @@ static void cmd_shoot(Player *p, Room rooms[], Game games[], Player players[], i
         room_set_phase(r, PHASE_FINISHED);
     }
 
+    for (int slot = 0; slot < 2; slot++) {
+        if (!r->slot_connected[slot]) continue;
+        Player *pp = find_player_by_fd(players, r->player_fds[slot]);
+        if (pp) game_send_state(g, r, pp);
+    }
 
     game_send_turn(g, r, players);
 }
@@ -510,18 +561,43 @@ void protocol_handle_line(Player *p, Room rooms[], Game games[], Player players[
     }
 
     if (strcmp(cmd, "LEAVE") == 0) { cmd_leave(p, rooms, games, players); return; }
-    if (strcmp(cmd, "PLACING_START") == 0 || strcmp(cmd, "PLACING") == 0) { cmd_placing(p, rooms, games, players); return; }
-    if (strcmp(cmd, "PLACING_STOP") == 0 || strcmp(cmd, "PLACING_END") == 0) { cmd_placing_stop(p, rooms, games, players); return; }
 
+    // Clean setup placing protocol:
+    //   PLACING_START
+    //   PLACING x y len dir   (repeat)
+    //   PLACING_END
+    //
+    // Compatibility: also accepts "PLACING START"/"PLACING END" and legacy PLACING_STOP.
+    if (strcmp(cmd, "PLACING_START") == 0) { cmd_placing_start(p, rooms, games, players); return; }
+    if (strcmp(cmd, "PLACING_END") == 0) { cmd_placing_end(p, rooms, games, players); return; }
+    if (strcmp(cmd, "PLACING_STOP") == 0) { cmd_placing_end(p, rooms, games, players); return; }
+
+    if (strcmp(cmd, "PLACE") == 0) {
+        // PLACING START / END (space form)
+        char sub[16] = {0};
+        if (sscanf(line, "PLACE %15s", sub) == 1) {
+            if (strcmp(sub, "START") == 0) { cmd_placing_start(p, rooms, games, players); return; }
+            if (strcmp(sub, "END") == 0) { cmd_placing_end(p, rooms, games, players); return; }
+        }
+
+        int x, y, len; char dir;
+        if (sscanf(line, "PLACE %d %d %d %c", &x, &y, &len, &dir) != 4) {
+            net_send_all(p->socket_fd, "ERROR BAD_ARGS\n");
+            strike(p, rooms, games, players, NULL);
+            return;
+        }
+        cmd_placing_add(p, rooms, games, players, x, y, len, dir);
+        return;
+    }
+
+    // Legacy: PLACE ... will just return "ERROR PLACE USE_PLACING"
     if (strcmp(cmd, "PLACE") == 0) {
         int x,y,len; char dir;
         if (sscanf(line, "PLACE %d %d %d %c", &x, &y, &len, &dir) != 4) { net_send_all(p->socket_fd, "ERROR BAD_ARGS\n"); strike(p, rooms, games, players, NULL); return; }
         cmd_place(p, rooms, games, players, x, y, len, dir);
         return;
     }
-
-    if (strcmp(cmd, "READY") == 0) { cmd_ready(p, rooms, games, players); return; }
-
+    if (strcmp(cmd, "READY") == 0) { net_send_all(p->socket_fd, "ERROR READY_DISABLED"); strike(p, rooms, games, players, NULL); return; }
     if (strcmp(cmd, "SHOOT") == 0) {
         int x,y;
         if (sscanf(line, "SHOOT %d %d", &x, &y) != 2) { net_send_all(p->socket_fd, "ERROR BAD_ARGS\n"); strike(p, rooms, games, players, NULL); return; }

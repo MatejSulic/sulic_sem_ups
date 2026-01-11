@@ -39,6 +39,27 @@ void game_room_init(Game *g, int room_id) {
     g->winner = -1;
 }
 
+// NEW: clear only one player's setup (used by batch PLACING_STOP)
+void game_clear_player_setup(Game *g, int slot) {
+    if (!g || !g->in_use) return;
+    if (slot < 0 || slot > 1) return;
+
+    for (int y = 0; y < GAME_N; y++) {
+        for (int x = 0; x < GAME_N; x++) {
+            g->board[slot][y][x] = 0;
+            g->ship_id[slot][y][x] = 0;
+        }
+    }
+
+    g->ready[slot] = 0;
+    g->ships_alive[slot] = 0;
+
+    for (int s = 0; s < GAME_FLEET; s++) {
+        g->ship_used[slot][s] = 0;
+        g->ships_left_count[slot][s] = 0;
+    }
+}
+
 int game_all_ready(const Game *g) {
     return g && g->ready[0] && g->ready[1];
 }
@@ -214,13 +235,21 @@ void game_send_state(const Game *g, const Room *r, Player *to) {
 }
 
 void game_send_turn(const Game *g, const Room *r, Player players[]) {
+    (void)players; // už ho nepotřebujeme
+
     if (!g || !r) return;
+    if (!g->in_use || !game_all_ready(g) || g->finished) return;
+
     for (int slot = 0; slot < 2; slot++) {
-        if (!r->slot_connected[slot]) continue;
-        Player *p = find_player_by_fd(players, r->player_fds[slot]);
-        if (!p) continue;
-        if (!g->in_use || !game_all_ready(g) || g->finished) continue;
-        if (g->turn == slot) net_send_all(p->socket_fd, "YOUR_TURN\n");
-        else net_send_all(p->socket_fd, "OPP_TURN\n");
+        int fd = r->player_fds[slot];
+        if (fd < 0) continue; // slot prázdný
+
+        if (g->turn == slot) {
+            net_send_all(fd, "YOUR_TURN\n");
+            log_info("Turn -> slot=%d fd=%d YOUR_TURN", slot, fd);
+        } else {
+            net_send_all(fd, "OPP_TURN\n");
+            log_info("Turn -> slot=%d fd=%d OPP_TURN", slot, fd);
+        }
     }
 }

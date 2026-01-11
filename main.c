@@ -57,8 +57,17 @@ static void tick(Room rooms[], Game games[], Player players[]) {
                         net_send_all(pp->socket_fd, "RETURNED_TO_LOBBY\n");
                     }
                     // hard reset the slot so it can be reused
-                    player_reset(pp);
+                    if (pp->socket_fd >= 0) {
+                        // still connected -> do NOT close fd
+                        pp->current_room_id = -1;
+                        pp->player_slot = -1;
+                    }else {
+                        // ghost slot reserved for rejoin (socket_fd == -1) or marked disconnected
+                        // room is gone -> free it
+                        player_reset(pp);}
+
                 }
+                
             }
 
             room_reset(r);

@@ -7,21 +7,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
-static void die(const char *msg) { perror(msg); exit(1); }
+static void die(const char *msg) {
+    perror(msg);
+    exit(1);
+}
 
 void net_send_all(int fd, const char *s) {
-    size_t n = strlen(s);
-    while (n > 0) {
-        ssize_t w = send(fd, s, n, 0);
+    size_t len = strlen(s);
+    while (len > 0) {
+        ssize_t w = send(fd, s, len, 0);
         if (w < 0) {
             if (errno == EINTR) continue;
             return;
         }
-        s += (size_t)w;
-        n -= (size_t)w;
+        s += w;
+        len -= w;
     }
 }
 
@@ -30,48 +32,49 @@ int net_make_listen_socket(const char *ip, int port) {
     if (s < 0) die("socket");
 
     int yes = 1;
-    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0)
-        die("setsockopt(SO_REUSEADDR)");
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons((uint16_t)port);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &a.sin_addr);
 
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
-        fprintf(stderr, "Bad IP: %s\n", ip);
-        exit(1);
-    }
-
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) die("bind");
+    if (bind(s, (struct sockaddr *)&a, sizeof(a)) < 0) die("bind");
     if (listen(s, 16) < 0) die("listen");
     return s;
+}
+
+void player_reset(Player *p) {
+    if (!p) return;
+    if (p->socket_fd >= 0) close(p->socket_fd);
+    memset(p, 0, sizeof(*p));
+    p->socket_fd = -1;
+    p->current_room_id = -1;
+    p->player_slot = -1;
+    p->placing_mode = 0;
+    p->pending_count = 0;
+    memset(p->pending, 0, sizeof(p->pending));
 }
 
 void player_soft_disconnect(Player *p) {
     if (!p) return;
     if (p->socket_fd >= 0) close(p->socket_fd);
     p->socket_fd = -1;
-    p->rx_len = 0;
     p->connected = 0;
-    p->disconnected_at = time(NULL);
+    p->placing_mode = 0;
+    p->pending_count = 0;
+    memset(p->pending, 0, sizeof(p->pending));
 }
 
-void player_reset(Player *p) {
+void player_to_lobby(Player *p) {
     if (!p) return;
-    if (p->socket_fd >= 0) close(p->socket_fd);
-    p->socket_fd = -1;
-    p->rx_len = 0;
-    p->is_identified = 0;
-    p->player_name[0] = '\0';
     p->current_room_id = -1;
     p->player_slot = -1;
-    p->invalid_count = 0;
-    p->connected = 0;
-    p->disconnected_at = 0;
+    p->placing_mode = 0;
+    p->pending_count = 0;
 }
 
-Player* find_player_by_fd(Player players[], int fd) {
+Player *find_player_by_fd(Player players[], int fd) {
     for (int i = 0; i < MAX_PLAYERS; i++)
         if (players[i].socket_fd == fd) return &players[i];
     return NULL;
