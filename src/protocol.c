@@ -423,7 +423,8 @@ static void cmd_ready(Player *p, Room rooms[], Game games[], Player players[]) {
 
 
 
-static void cmd_shoot(Player *p, Room rooms[], Game games[], Player players[], int x, int y) {
+static void cmd_shoot(Player *p, Room rooms[], Game games[], Player players[], int x, int y)
+{
     if (!p->is_identified) { net_send_all(p->socket_fd, "ERROR MUST_HELLO\n"); strike(p, rooms, games, players, NULL); return; }
     if (p->current_room_id == -1) { net_send_all(p->socket_fd, "ERROR NOT_IN_ROOM\n"); strike(p, rooms, games, players, NULL); return; }
 
@@ -447,18 +448,25 @@ static void cmd_shoot(Player *p, Room rooms[], Game games[], Player players[], i
     if (res == 0) {
         net_send_all(p->socket_fd, "WATER\n");
         notify_opponent(r, players, p->player_slot, "OPP_WATER\n");
+
     } else if (res == 1) {
         net_send_all(p->socket_fd, "HIT\n");
         notify_opponent(r, players, p->player_slot, "OPP_HIT\n");
+
     } else if (res == 2) {
-        net_send_all(p->socket_fd, "SINK\n");
-        notify_opponent(r, players, p->player_slot, "OPP_SINK\n");
+        // --- SUNK x y len dir ---
+        int victim_slot = 1 - p->player_slot;
+        unsigned char sid = g->ship_id[victim_slot][y][x];
+
+        Player *opponent = &players[r->player_fds[victim_slot]];
+
+        game_send_sunk_def(g, victim_slot, sid, p, opponent);
+
     } else if (res == 3) {
         net_send_all(p->socket_fd, "WIN\n");
         notify_opponent(r, players, p->player_slot, "LOSE\n");
         room_set_phase(r, PHASE_FINISHED);
     }
-
 
     game_send_turn(g, r, players);
 }

@@ -253,3 +253,81 @@ void game_send_turn(const Game *g, const Room *r, Player players[]) {
         }
     }
 }
+
+
+int game_ship_def_from_sid(const Game *g, int victim_slot, unsigned char sid,
+                           int *out_x, int *out_y, int *out_len, char *out_dir)
+{
+    if (!g) return 0;
+    if (victim_slot < 0 || victim_slot > 1) return 0;
+    if (sid == 0) return 0;
+
+    int minx = GAME_N, miny = GAME_N, maxx = -1, maxy = -1;
+    int count = 0;
+
+    for (int y = 0; y < GAME_N; y++) {
+        for (int x = 0; x < GAME_N; x++) {
+            if (g->ship_id[victim_slot][y][x] == sid) {
+                count++;
+                if (x < minx) minx = x;
+                if (y < miny) miny = y;
+                if (x > maxx) maxx = x;
+                if (y > maxy) maxy = y;
+            }
+        }
+    }
+
+    if (count <= 0) return 0;
+
+    // decide direction
+    // (normal ships are straight so either width or height is >0)
+    char dir = (miny == maxy) ? 'H' : 'V';
+
+    int sx = minx;
+    int sy = miny;
+
+    // If something weird happened (both spans > 0), pick the longer span as direction.
+    if (miny != maxy && minx != maxx) {
+        int spanx = maxx - minx;
+        int spany = maxy - miny;
+        dir = (spanx >= spany) ? 'H' : 'V';
+    }
+
+    if (dir == 'H') {
+        sy = miny;     // row is fixed
+        sx = minx;     // start = leftmost
+    } else {
+        sx = minx;     // column is fixed
+        sy = miny;     // start = topmost
+    }
+
+    if (out_x)   *out_x = sx;
+    if (out_y)   *out_y = sy;
+    if (out_len) *out_len = count;   // ship length = number of cells with sid
+    if (out_dir) *out_dir = dir;
+
+    return 1;
+}
+
+// Convenience: sends "SUNK x y len dir\n" to shooter and "OPP_SUNK x y len dir\n" to victim.
+// You call it when you detect sink and you already know victim_slot + sid.
+void game_send_sunk_def(const Game *g, int victim_slot, unsigned char sid,
+                        Player *shooter, Player *victim)
+{
+    int x, y, len;
+    char dir;
+    if (!game_ship_def_from_sid(g, victim_slot, sid, &x, &y, &len, &dir))
+        return;
+
+    char line[64];
+
+    if (shooter) {
+        snprintf(line, sizeof(line), "SUNK %d %d %d %c\n", x, y, len, dir);
+        net_send_all(shooter->socket_fd, line);
+    }
+    if (victim) {
+        snprintf(line, sizeof(line), "OPP_SUNK %d %d %d %c\n", x, y, len, dir);
+        net_send_all(victim->socket_fd, line);
+    }
+}
+

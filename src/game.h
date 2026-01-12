@@ -35,3 +35,10 @@ int game_shoot(Game *g, int slot, int x, int y, char *err, int errsz);
 
 void game_send_state(const Game *g, const Room *r, Player *to);
 void game_send_turn(const Game *g, const Room *r, Player players[]);
+
+int game_ship_def_from_sid(const Game *g, int victim_slot, unsigned char sid,
+                           int *out_x, int *out_y, int *out_len, char *out_dir);
+
+void game_send_sunk_def(const Game *g, int victim_slot, unsigned char sid,
+                        Player *shooter, Player *victim);
+
