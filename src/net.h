@@ -35,6 +35,11 @@ typedef struct Player {
     int pending_count;
     PendingShip pending[PENDING_MAX];
 
+        // === heartbeat (server -> client PING, client -> server PONG) ===
+    time_t last_ping;   // last time server sent PING
+    int hb_missed;      // consecutive missed PONGs
+
+
 } Player;
 
 int net_make_listen_socket(const char *ip, int port);

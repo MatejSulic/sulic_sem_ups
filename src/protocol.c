@@ -10,6 +10,9 @@
 #include <sys/socket.h>
 
 #define MAX_INVALID 5
+#define HB_INTERVAL_SEC 1
+#define HB_MAX_MISSES 3
+
 // batch placement helpers
 static void pending_reset(Player *p) {
     if (!p) return;
@@ -130,10 +133,12 @@ static void cmd_hello(Player *p, const char *name) {
 
     p->is_identified = 1;
     p->connected = 1;
-
+    p->last_ping = 0;
+    p->hb_missed = 0;
     char out[128];
     snprintf(out, sizeof(out), "WELCOME %s\n", p->player_name);
     net_send_all(p->socket_fd, out);
+    
 
     log_info("player fd=%d identified as '%s'", p->socket_fd, p->player_name);
 }
@@ -527,6 +532,9 @@ void protocol_handle_line(Player *p, Room rooms[], Game games[], Player players[
         cmd_rejoin(p, rooms, games, players, rid);
         return;
     }
+    if (strcmp(cmd, "PONG") == 0) { p->hb_missed = 0; return; }
+    if (strcmp(cmd, "PING") == 0) { net_send_all(p->socket_fd, "PONG\n"); return; }
+
 
     if (strcmp(cmd, "LEAVE") == 0) { cmd_leave(p, rooms, games, players); return; }
     if (strcmp(cmd, "PLACING_START") == 0 || strcmp(cmd, "PLACING") == 0) { cmd_placing(p, rooms, games, players); return; }
@@ -643,5 +651,25 @@ void protocol_process_incoming(Player *p, Room rooms[], Game games[], Player pla
             if (rm) destroy_room(rm, games, players);
         }
         player_reset(p);
+    }
+}
+void protocol_heartbeat_tick(Room rooms[], Game games[], Player players[]) {
+    time_t now = time(NULL);
+
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        Player *p = &players[i];
+        if (p->socket_fd < 0) continue;
+        if (!p->connected) continue;
+
+        if (p->last_ping == 0 || (now - p->last_ping) >= HB_INTERVAL_SEC) {
+            net_send_all(p->socket_fd, "PING\n");
+            p->last_ping = now;
+
+            p->hb_missed++;
+
+            if (p->hb_missed >= HB_MAX_MISSES) {
+                heartbeat_soft_disconnect(p, rooms, games, players);
+            }
+        }
     }
 }

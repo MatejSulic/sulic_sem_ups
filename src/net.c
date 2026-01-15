@@ -53,6 +53,9 @@ void player_reset(Player *p) {
     p->player_slot = -1;
     p->placing_mode = 0;
     p->pending_count = 0;
+    p->last_ping = 0;
+    p->hb_missed = 0;
+
     memset(p->pending, 0, sizeof(p->pending));
 }
 
@@ -63,6 +66,9 @@ void player_soft_disconnect(Player *p) {
     p->connected = 0;
     p->placing_mode = 0;
     p->pending_count = 0;
+    p->last_ping = 0;
+    p->hb_missed = 0;
+
     memset(p->pending, 0, sizeof(p->pending));
 }
 

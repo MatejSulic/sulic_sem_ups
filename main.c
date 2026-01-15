@@ -121,6 +121,9 @@ int main(int argc, char **argv) {
 
         // periodic maintenance
         tick(rooms, games, players);
+        // heartbeat: server pinguje klienty, po 3 missed PONG => opponent down
+        protocol_heartbeat_tick(rooms, games, players);
+
 
         // new player
         if (rc > 0 && FD_ISSET(listen_fd, &readfds)) {
