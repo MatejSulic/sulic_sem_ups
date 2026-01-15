@@ -653,6 +653,37 @@ void protocol_process_incoming(Player *p, Room rooms[], Game games[], Player pla
         player_reset(p);
     }
 }
+static void heartbeat_soft_disconnect(Player *p, Room rooms[], Game games[], Player players[]) {
+    if (!p) return;
+
+    log_info("fd=%d heartbeat timeout -> soft disconnect", p->socket_fd);
+
+    if (p->current_room_id != -1) {
+        Room *rm = find_room_by_id(rooms, p->current_room_id);
+        if (rm && p->player_slot >= 0) {
+
+            if (rm->phase == PHASE_SETUP || rm->phase == PHASE_PLAY) {
+                room_mark_down(rm, p->player_slot);
+                notify_opponent(rm, players, p->player_slot, "OPPONENT_DOWN\n");
+                player_soft_disconnect(p);
+                return;
+            }
+
+            // immediate close outside SETUP/PLAY (same as recv==0)
+            log_info("room=%d phase=%s: immediate close on heartbeat timeout",
+                     rm->id, room_phase_str(rm->phase));
+
+            room_mark_down(rm, p->player_slot);
+            player_soft_disconnect(p);
+            close_room_now(rm, games, players, "DISCONNECT");
+            return;
+        }
+    }
+
+    // not in room -> just reset like recv==0 fallback
+    player_reset(p);
+}
+
 void protocol_heartbeat_tick(Room rooms[], Game games[], Player players[]) {
     time_t now = time(NULL);
 
