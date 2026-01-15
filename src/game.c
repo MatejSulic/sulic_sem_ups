@@ -223,6 +223,7 @@ void game_send_state(const Game *g, const Room *r, Player *to) {
 
     int slot = to->player_slot;
     if (slot < 0 || slot > 1) slot = 0;
+    
 
     snprintf(line, sizeof(line), "STATE ROOM=%d YOU=%d READY=%d/%d TURN=%d FIN=%d WIN=%d\n",
              r->id, slot + 1, g->ready[0], g->ready[1], g->turn + 1,

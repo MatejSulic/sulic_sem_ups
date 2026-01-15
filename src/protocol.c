@@ -96,12 +96,17 @@ static Game* game_for_room(Room *r, Game games[]) {
 }
 
 static void notify_opponent(Room *r, Player players[], int slot, const char *msg) {
-    int opp = (slot == 0) ? 1 : 0;
+    (void)players; 
     if (!r || !msg) return;
-    if (!r->slot_connected[opp]) return;
-    Player *op = find_player_by_fd(players, r->player_fds[opp]);
-    if (op) net_send_all(op->socket_fd, msg);
+
+    int opp = (slot == 0) ? 1 : 0;
+
+    int fd = r->player_fds[opp];
+    if (fd < 0) return;                 
+
+    net_send_all(fd, msg);
 }
+
 
 static Player* find_disconnected_player_by_nick(Player players[], const char *nick, int room_id, int slot) {
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -237,9 +242,12 @@ static void cmd_rejoin(Player *p, Room rooms[], Game games[], Player players[], 
     Game *g = game_for_room(r, games);
 
     if (r->phase == PHASE_SETUP) {
-        net_send_all(p->socket_fd, "PHASE SETUP\n");
+        net_send_all(p->socket_fd, "SETUP\n");
     } else if (r->phase == PHASE_PLAY) {
-        if (g) game_send_state(g, r, p);
+        net_send_all(p->socket_fd, "PLAY\n");
+        game_send_turn(g, r, players);
+        if(g)game_send_state(g, r, p);
+        
     } else {
         char ph[64];
         snprintf(ph, sizeof(ph), "PHASE %s\n", room_phase_str(r->phase));
@@ -278,14 +286,17 @@ static void cmd_leave(Player *p, Room rooms[], Game games[], Player players[]) {
     net_send_all(p->socket_fd, out);
 
     if (r) {
-        int opp_slot = (p->player_slot == 0) ? 1 : 0;
-        if (r->slot_connected[opp_slot]) {
-            Player *opp = find_player_by_fd(players, r->player_fds[opp_slot]);
-            if (opp) net_send_all(opp->socket_fd, "OPPONENT_LEFT\n");
-        }
-        log_info("room=%d destroyed by LEAVE", rid);
-        destroy_room(r, games, players);
+    int opp_slot = (p->player_slot == 0) ? 1 : 0;
+
+    int opp_fd = r->player_fds[opp_slot];
+    if (opp_fd >= 0) {
+        net_send_all(opp_fd, "OPPONENT_LEFT\n");
     }
+
+    log_info("room=%d destroyed by LEAVE", rid);
+    destroy_room(r, games, players);
+}
+
 
     p->current_room_id = -1;
     p->player_slot = -1;
