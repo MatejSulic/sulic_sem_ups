@@ -99,16 +99,19 @@ static Game* game_for_room(Room *r, Game games[]) {
 }
 
 static void notify_opponent(Room *r, Player players[], int slot, const char *msg) {
-    (void)players; 
+    (void)players;
     if (!r || !msg) return;
 
     int opp = (slot == 0) ? 1 : 0;
 
+    if (!r->slot_connected[opp]) return; 
+
     int fd = r->player_fds[opp];
-    if (fd < 0) return;                 
+    if (fd < 0) return;
 
     net_send_all(fd, msg);
 }
+
 
 
 static Player* find_disconnected_player_by_nick(Player players[], const char *nick, int room_id, int slot) {
@@ -259,6 +262,7 @@ static void cmd_rejoin(Player *p, Room rooms[], Game games[], Player players[], 
         net_send_all(p->socket_fd, ph);
     }
 
+    //notify opponent 
     notify_opponent(r, players, slot, "OPPONENT_UP\n");
     log_info("player '%s' rejoined room=%d slot=%d", p->player_name, r->id, slot);
 }
