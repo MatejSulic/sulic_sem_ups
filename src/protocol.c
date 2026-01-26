@@ -10,7 +10,7 @@
 #include <sys/socket.h>
 
 #define MAX_INVALID 5
-#define HB_INTERVAL_SEC 1
+#define HB_INTERVAL_SEC 5
 #define HB_MAX_MISSES 3
 
 // batch placement helpers
