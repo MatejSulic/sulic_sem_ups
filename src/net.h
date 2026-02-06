@@ -7,38 +7,37 @@
 #define PENDING_MAX 5
 
 typedef struct PendingShip {
-    int x;
-    int y;
-    int len;
-    char dir; // 'H' or 'V'
+  int x;
+  int y;
+  int len;
+  char dir; // 'H' or 'V'
 } PendingShip;
 
 typedef struct Player {
-    int socket_fd;
+  int socket_fd;
 
-    char rx_buffer[BUF_SIZE];
-    size_t rx_len;
+  char rx_buffer[BUF_SIZE];
+  size_t rx_len;
 
-    int is_identified;
-    char player_name[32];
+  int is_identified;
+  char player_name[32];
 
-    int current_room_id;
-    int player_slot;
+  int current_room_id;
+  int player_slot;
 
-    int invalid_count;
+  int invalid_count;
 
-    int connected;
-    time_t disconnected_at;
+  int connected;
+  time_t disconnected_at;
 
-    // === batch setup placement ===
-    int placing_mode;
-    int pending_count;
-    PendingShip pending[PENDING_MAX];
+  // === batch setup placement ===
+  int placing_mode;
+  int pending_count;
+  PendingShip pending[PENDING_MAX];
 
-        // === heartbeat (server -> client PING, client -> server PONG) ===
-    time_t last_ping;   // last time server sent PING
-    int hb_missed;      // consecutive missed PONGs
-
+  // === heartbeat (server -> client PING, client -> server PONG) ===
+  time_t last_ping; // last time server sent PING
+  int hb_missed;    // consecutive missed PONGs
 
 } Player;
 

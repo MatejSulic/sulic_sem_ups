@@ -15,22 +15,28 @@
 
 #define RECONNECT_GRACE_SEC 45
 
-static void die(const char *msg) { perror(msg); exit(1); }
+static void die(const char *msg) {
+    perror(msg);
+    exit(1);
+}
 
 static void tick(Room rooms[], Game games[], Player players[]) {
+    // Periodická údržba: hlídá reconnect timeout a v případě vypršení roomku uklidí
     time_t now = time(NULL);
+
     for (int i = 0; i < MAX_ROOMS; i++) {
         Room *r = &rooms[i];
         if (r->state == ROOM_EMPTY) continue;
 
         for (int slot = 0; slot < 2; slot++) {
-            if (r->slot_connected[slot]) continue;
-            if (r->player_names[slot][0] == '\0') continue;
-            if (r->slot_down_since[slot] == 0) continue;
+            if (r->slot_connected[slot]) continue;          // slot je UP
+            if (r->player_names[slot][0] == '\0') continue; // není tam vůbec hráč
+            if (r->slot_down_since[slot] == 0) continue;    // nemáme čas výpadku
 
             double dt = difftime(now, r->slot_down_since[slot]);
             if (dt < RECONNECT_GRACE_SEC) continue;
 
+            // Grace vypršela: informujeme protivníka a zavíráme roomku
             int opp = (slot == 0) ? 1 : 0;
             if (r->slot_connected[opp]) {
                 Player *op = find_player_by_fd(players, r->player_fds[opp]);
@@ -42,32 +48,29 @@ static void tick(Room rooms[], Game games[], Player players[]) {
             }
 
             log_info("room=%d slot=%d timeout -> destroy", r->id, slot);
-            // destroy room + game
+
+            // Zrušíme hru navázanou na roomku (index = id-1)
             Game *g = &games[r->id - 1];
             game_reset(g);
 
-            // Detach ALL players bound to this room (connected and disconnected).
-            // Important: disconnected players still occupy a Player slot (reserved for REJOIN).
+            // Odpojíme VŠECHNY hráče navázané na tuto roomku:
+            // - připojeným pošleme info a vrátíme je do lobby
+            // - ghost sloty pro rejoin tvrdě uvolníme (player_reset)
             for (int pi = 0; pi < MAX_PLAYERS; pi++) {
                 Player *pp = &players[pi];
                 if (pp->is_identified && pp->current_room_id == r->id) {
-                    // if still connected, tell them explicitly
                     if (pp->socket_fd >= 0) {
                         net_send_all(pp->socket_fd, "ROOM_CLOSED TIMEOUT\n");
                         net_send_all(pp->socket_fd, "RETURNED_TO_LOBBY\n");
-                    }
-                    // hard reset the slot so it can be reused
-                    if (pp->socket_fd >= 0) {
-                        // still connected -> do NOT close fd
+
+                        // připojený hráč: fd necháme být, jen zrušíme vazbu na roomku
                         pp->current_room_id = -1;
                         pp->player_slot = -1;
-                    }else {
-                        // ghost slot reserved for rejoin (socket_fd == -1) or marked disconnected
-                        // room is gone -> free it
-                        player_reset(pp);}
-
+                    } else {
+                        // ghost slot: uvolníme celý záznam, aby se dal znovu použít
+                        player_reset(pp);
+                    }
                 }
-                
             }
 
             room_reset(r);
@@ -78,19 +81,27 @@ static void tick(Room rooms[], Game games[], Player players[]) {
 
 int main(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <ip> <port>\nExample: %s 0.0.0.0 5555\n", argv[0], argv[0]);
+        fprintf(stderr,
+                "Usage: %s <ip> <port>\nExample: %s 0.0.0.0 5555\n",
+                argv[0], argv[0]);
         return 1;
     }
 
     const char *ip = argv[1];
     int port = atoi(argv[2]);
-    if (port <= 0 || port > 65535) { fprintf(stderr, "Bad port\n"); return 1; }
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "Bad port\n");
+        return 1;
+    }
 
     int listen_fd = net_make_listen_socket(ip, port);
     log_info("server listening on %s:%d", ip, port);
 
     Player players[MAX_PLAYERS];
-    for (int i = 0; i < MAX_PLAYERS; i++) { players[i].socket_fd = -1; player_reset(&players[i]); }
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        players[i].socket_fd = -1;
+        player_reset(&players[i]);
+    }
 
     Room rooms[MAX_ROOMS];
     for (int i = 0; i < MAX_ROOMS; i++) room_reset(&rooms[i]);
@@ -117,31 +128,38 @@ int main(int argc, char **argv) {
         tv.tv_usec = 0;
 
         int rc = select(maxfd + 1, &readfds, NULL, NULL, &tv);
-        if (rc < 0) { if (errno == EINTR) continue; die("select"); }
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            die("select");
+        }
 
-        // periodic maintenance
+        // Periodická údržba
         tick(rooms, games, players);
-        // heartbeat: server pinguje klienty, po 3 missed PONG => opponent down
+
+        // Heartbeat: server pinguje klienty, po pár missed PONG to řeší jako „down“
         protocol_heartbeat_tick(rooms, games, players);
 
-
-        // new player
+        // Nové připojení
         if (rc > 0 && FD_ISSET(listen_fd, &readfds)) {
             int new_fd = accept(listen_fd, NULL, NULL);
             if (new_fd >= 0) {
                 int placed = 0;
                 for (int i = 0; i < MAX_PLAYERS; i++) {
-                    // only truly free slots (not reserved for reconnect)
+                    // bereme jen skutečně volné sloty (ne ghost sloty držené kvůli rejoinu)
                     if (players[i].socket_fd < 0 && players[i].is_identified == 0) {
                         players[i].socket_fd = new_fd;
                         players[i].rx_len = 0;
+
                         players[i].is_identified = 0;
                         players[i].player_name[0] = '\0';
+
                         players[i].current_room_id = -1;
                         players[i].player_slot = -1;
+
                         players[i].invalid_count = 0;
                         players[i].connected = 1;
                         players[i].disconnected_at = 0;
+
                         placed = 1;
                         break;
                     }
@@ -157,10 +175,11 @@ int main(int argc, char **argv) {
             }
         }
 
-        // data from players
+        // Data od hráčů
         if (rc > 0) {
             for (int i = 0; i < MAX_PLAYERS; i++) {
-                if (players[i].socket_fd >= 0 && FD_ISSET(players[i].socket_fd, &readfds)) {
+                if (players[i].socket_fd >= 0 &&
+                    FD_ISSET(players[i].socket_fd, &readfds)) {
                     protocol_process_incoming(&players[i], rooms, games, players);
                 }
             }
